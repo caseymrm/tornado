@@ -24,6 +24,9 @@ import ioloop
 import iostream
 import logging
 import os
+import random
+import select
+import signal
 import socket
 import time
 import urlparse
@@ -114,6 +117,11 @@ class HTTPServer(object):
         self.ssl_options = ssl_options
         self._socket = None
         self._started = False
+        self._worker_info = []
+        self._num_workers = 1
+        self._signals = [signal.SIGQUIT, signal.SIGINT, signal.SIGUSR1,
+                         signal.SIGUSR2, signal.SIGWINCH, signal.SIGTTIN,
+                         signal.SIGTTOU, signal.SIGHUP]
 
     def listen(self, port, address=""):
         """Binds to the given port and starts the server in a single process.
@@ -172,19 +180,167 @@ class HTTPServer(object):
                           "has already been initialized. You cannot call "
                           "IOLoop.instance() before calling start()")
             num_processes = 1
+        self._num_workers = num_processes
         if num_processes > 1:
             logging.info("Pre-forking %d server processes", num_processes)
             for i in range(num_processes):
-                if os.fork() == 0:
-                    ioloop.IOLoop.instance().add_handler(
-                        self._socket.fileno(), self._handle_events,
-                        ioloop.IOLoop.READ)
+                if self._fork_worker():
                     return
+
+            self._monitor_workers()
             os.waitpid(-1, 0)
         else:
             io_loop = self.io_loop or ioloop.IOLoop.instance()
             io_loop.add_handler(self._socket.fileno(), self._handle_events,
                                 ioloop.IOLoop.READ)
+
+    def _fork_worker(self):
+        # create shared tmpfile for detecting dead clients
+        f = os.tmpfile()
+        fd = f.fileno()
+
+        worker = {
+          'file': f,
+          'fd': fd
+        }
+        
+        pid = os.fork()
+        if pid == 0:
+            # clear any master signals, set up client signals
+            for s in self._signals:
+                signal.signal(s, signal.SIG_DFL)
+            signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+
+            # todo: signal.signal(signal.SIGUSR1, reopen logs)
+
+            signal.signal(signal.SIGQUIT,
+                          lambda x,y: ioloop.IOLoop.instance().stop())
+            for s in [signal.SIGTERM, signal.SIGINT]:
+                signal.signal(s, lambda x,y: exit(0))
+
+            self._worker_info = worker
+            ioloop.IOLoop.instance().add_handler(
+                self._socket.fileno(), self._handle_events,
+                ioloop.IOLoop.READ)
+            ioloop.PeriodicCallback(
+                self._worker_alive, 3000).start()
+            return True
+        worker['pid'] = pid
+        self._worker_info.append(worker)
+
+    def _worker_alive(self):
+        os.fchmod(self._worker_info['fd'], random.randint(0, 10))
+
+    def _monitor_workers(self):
+        respawn = True
+
+        # create self-pipe to wake from signals
+        sr,sw = os.pipe()
+        fcntl.fcntl(sr,
+                    fcntl.F_SETFL,
+                    fcntl.fcntl(sr, fcntl.F_GETFL) | os.O_NONBLOCK)
+        fcntl.fcntl(sw,
+                    fcntl.F_SETFL,
+                    fcntl.fcntl(sw, fcntl.F_GETFL) | os.O_NONBLOCK)
+        sr,sw = os.fdopen(sr,'r',0), os.fdopen(sw,'w',0)
+
+        # set up signal handlers and queue
+        signal_queue = []
+
+        def defer_signal(signum, frame):
+            if len(signal_queue) < 5:
+                signal_queue.append(signum)
+                sw.write('x')
+            else:
+                logging.error("ignoring signal")
+
+        for s in self._signals:
+            signal.signal(s, defer_signal)
+        signal.signal(signal.SIGCHLD, lambda x,y: sw.write('x'))
+
+        while True:
+            try:
+                select.select([sr], [], [], 1)
+            except select.error:
+                # signals cause an exception
+                pass
+
+            try:
+                while True:
+                    sr.read()
+            except IOError:
+                pass
+
+            while len(signal_queue):
+                sig = signal_queue.pop()
+                logging.info("signal queue %s" % sig)
+                if sig == signal.SIGQUIT:
+                    # graceful shutdown
+                    self._signal_workers(signal.SIGQUIT)
+                    return
+                elif sig == signal.SIGTERM or sig == signal.SIGINT:
+                    # fast shutdown
+                    self._signal_workers(sig)
+                    return
+                elif sig == signal.SIGUSR1:
+                    # todo: rotate logs
+                    pass
+                elif sig == signal.SIGUSR2:
+                    # todo: upgrade executable on the fly
+                    pass
+                elif sig == signal.SIGWINCH:
+                    # shutdown workers cleanly
+                    respawn = False
+                    self._signal_workers(signal.SIGQUIT)
+                elif sig == signal.SIGTTIN:
+                    self._num_workers += 1
+                elif sig == signal.SIGTTOU:
+                    if self._num_workers > 0:
+                        self._num_workers -= 1
+                elif sig == signal.SIGHUP:
+                    # todo: reload config file
+                    respawn = True
+                    pass
+
+            num_to_start = self._num_workers - len(self._worker_info)
+
+            logging.info("checking %s, starting %s" % (len(self._worker_info),
+                                                       num_to_start))
+            for w in self._worker_info:
+                ctime = os.fstat(w['fd']).st_ctime
+                age = time.time() - ctime
+
+                if age > 5:
+                    logging.error("%s = %s, killing overdue worker"
+                                  % (w['pid'], age))
+                    self._kill_worker(w)
+                else:
+                    logging.info("%s = %s" % (w['pid'], age))
+
+            if num_to_start > 0:
+                if respawn:
+                    for i in range(num_to_start):
+                        if self._fork_worker():
+                            return
+            elif num_to_start < 0:
+                for w in self._worker_info[num_to_start:]:
+                    self._kill_worker(w, signal.SIGQUIT)
+
+    def _kill_worker(self, worker, sig=signal.SIGKILL):
+        try:
+            os.kill(worker['pid'], sig)
+        except:
+            pass
+
+        self._worker_info = [w for w in self._worker_info if \
+                                 w['pid'] != worker['pid']]
+
+    def _signal_workers(self, sig):
+        for w in self._worker_info:
+            try:
+                os.kill(w['pid'], sig)
+            except OSError:
+                pass
 
     def _handle_events(self, fd, events):
         while True:
